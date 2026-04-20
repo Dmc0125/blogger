@@ -7,6 +7,7 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:path/filepath"
+import "core:strconv"
 import "core:strings"
 
 import http "../vendor/odin-http"
@@ -16,37 +17,71 @@ PROGRAM_MEMORY: [100 * mem.Megabyte]byte
 
 GITHUB_API_URL :: "https://api.github.com"
 
-FILE_TEMPL :: `
-        %s:
-            - changes +%d / -%d
+FILE_TEMPL :: `        %s:
+            - status: %s
+            - changes +%d/-%d
             - patch: %s
 `
-
-COMMIT_TEMPL :: `
-%s:
+COMMIT_TEMPL :: `%s:
     - author: %s
     - message: %s
-    - changes: +%d / -%d
+    - changes: +%d/-%d
     - files:
         %s
 `
-
 PROMPT_TEMPL :: `You are a technical blog writer. You will be given technical project data (commit history) and based on that you will write a blog post about building this project.
+
+Patch format explanation:
+- Added files show the full file content
+- Modified files show only changed lines
+- Lines starting with - were removed
+- Lines starting with + were added
+- L<number>: indicates the line number where the change occurs
+- Separate L markers within one file mean changes in different parts of the file
+
+Write the blog post with somewhat following structure (you can modifiy the structure however you want if it fits the blog post more):
+
+## Introduction
+- What is this project?
+- What problem does it solve?
+
+## Tech Stack
+- What languages/frameworks/libraries were used and why?
+
+## The Build Process
+- Walk through the development chronologically
+- Group related commits into phases (e.g. "Setting up the project", "Core logic", "Polish")
+- For each phase, explain what was done and why
+
+## Interesting Code
+- Pick 2-3 interesting snippets from the patches and explain them
+- Use code blocks with the correct language
+
+## Challenges
+- What was tricky? (look for commits that revert, refactor, or fix things)
+
+## Final Architecture
+- How is the codebase structured?
+- How do the pieces fit together?
+
+Write as if you're explaining to a fellow developer over coffee.
+Don't be overly formal. Don't use phrases like "In conclusion" or
+"It's worth noting". Don't use filler. Be direct.
+
+Do NOT:
+- Make up information that isn't in the commit data
+- Guess at motivation unless it's obvious from the commits
+- Use generic filler like "This was a great learning experience"
+- Explain basic programming concepts
+- Write an introduction that starts with "In today's world..."
 
 Project name: %s
 
-Commits:
+Author's notes:
 %s
 
-Writing instructions:
-
-Write in first person. Include:
-- Project description
-- Key technical decisions
-- Challenges and how they were solved
-- Final architecture overview
-
-You can also include code blocks if there is any interesting stuff and explain them
+Commits:
+%s
 `
 
 create_arena :: proc(backing_allocator: mem.Allocator, size: int) -> (allocator: mem.Allocator) {
@@ -142,6 +177,85 @@ Commit_Details :: struct {
 		deletions: i32,
 	},
 	files:  []Commit_File,
+}
+
+minify_patch :: proc(patch, status: string, allocator: mem.Allocator) -> string {
+	if patch == "" || status == "removed" {
+		return ""
+	}
+
+	patch_lines := strings.split_lines(patch, allocator)
+	defer delete(patch_lines, allocator)
+
+	switch status {
+	case "added":
+		// NOTE: ignore the first line, that's hunk header
+		patch_lines_without_header := patch_lines[1:]
+
+		out: strings.Builder
+		strings.builder_init(&out, allocator)
+
+		for line, i in patch_lines_without_header {
+			strings.write_string(&out, line[1:])
+			if i != len(patch_lines_without_header) - 1 {
+				strings.write_byte(&out, '\n')
+			}
+		}
+		return string(out.buf[:])
+	case "modified", "renamed":
+		out: strings.Builder
+		strings.builder_init(&out, allocator)
+
+		change_line_start: int
+		first_change_line: bool
+
+		for line, i in patch_lines {
+			switch {
+			case strings.has_prefix(line, "@@"):
+				// hunk header
+				ok: bool
+				n: int
+				if change_line_start, _ = strconv.parse_int(line[4:], 10, &n); n == 0 {
+					assert(
+						false,
+						fmt.aprintf(
+							"unable to parse int: \"%s\"",
+							line[4:],
+							allocator = allocator,
+						),
+					)
+				}
+				first_change_line = true
+			case line[0] == '-', line[0] == '+':
+				if first_change_line {
+					line_num := fmt.aprintf("L%d:\n", change_line_start, allocator = allocator)
+					defer delete(line_num, allocator)
+					strings.write_string(&out, line_num)
+					first_change_line = false
+				}
+
+				if line[0] == '-' {
+					change_line_start += 1
+				}
+
+				strings.write_string(&out, line)
+				strings.write_byte(&out, '\n')
+			case:
+				// context line
+				change_line_start += 1
+				first_change_line = true
+			}
+		}
+
+		out_without_nl := make([]byte, len = len(out.buf) - 1, allocator = allocator)
+		copy(out_without_nl, out.buf[:len(out.buf) - 1])
+		strings.builder_destroy(&out)
+
+		return string(out_without_nl)
+	}
+
+	assert(false, fmt.aprintf("invalid status: %s", status, allocator = allocator))
+	return ""
 }
 
 main :: proc() {
@@ -260,7 +374,18 @@ main :: proc() {
 		files_str: strings.Builder
 		strings.builder_init(&files_str, allocator = temp_allocator)
 
-		for file, i in details.files {
+		file_loop: for file, i in details.files {
+			ignore_directories :: [?]string{"vendor", "target"}
+			for dir in ignore_directories {
+				if strings.contains(
+					file.filename,
+					fmt.aprintf("%s/", dir, allocator = temp_allocator),
+				) {
+					continue file_loop
+				}
+			}
+
+
 			ignore_suffixes :: [?]string {
 				// lock files
 				".lock",
@@ -274,8 +399,6 @@ main :: proc() {
 				".exe",
 			}
 			ignore_filenames :: [?]string{"package-lock.json"}
-			ignore_directories :: [?]string{"vendor", "target"}
-
 			skip_patch: bool
 
 			for suffix in ignore_suffixes {
@@ -294,26 +417,15 @@ main :: proc() {
 				}
 			}
 
-			if !skip_patch {
-				for dir in ignore_directories {
-					if strings.contains(
-						file.raw_url,
-						fmt.aprintf("/%s/", dir, allocator = temp_allocator),
-					) {
-						skip_patch = true
-						break
-					}
-				}
-			}
-
 			patch: string
 			if !skip_patch {
-				patch = file.patch
+				patch = minify_patch(file.patch, file.status, temp_allocator)
 			}
 
 			str := fmt.aprintf(
 				FILE_TEMPL,
 				file.filename,
+				file.status,
 				file.additions,
 				file.deletions,
 				patch,
