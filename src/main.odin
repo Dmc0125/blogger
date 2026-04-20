@@ -18,7 +18,7 @@ import http_client "../vendor/odin-http/client"
 PROGRAM_MEMORY: [100 * mem.Megabyte]byte
 
 GITHUB_API_URL :: "https://api.github.com"
-OPEN_AI_API_URL :: "https://api.openai.com"
+OPEN_AI_API_URL :: "https://api.openai.com/v1"
 
 FILE_TEMPL :: `        %s:
             - status: %s
@@ -170,8 +170,11 @@ http_request :: proc(
 	res := http_client.request(request, url, http_allocator) or_return
 	body, _ := http_client.response_body(&res, allocator = http_allocator) or_return
 
+	// TODO: handle response status not ok
+
 	if log {
-		fmt.println(body)
+		fmt.println("Headers: ", res.headers)
+		fmt.println("Body: ", body)
 	}
 
 	#partial switch b in body {
@@ -309,6 +312,55 @@ CLR_GRAY :: "\x1b[38;2;150;150;150m"
 CLR_SUCCESS :: "\x1b[38;2;17;180;72m"
 DIVIDER :: "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
+Print_Status :: enum {
+	Loading,
+	Success,
+}
+
+@(rodata)
+print_preset := [Print_Status]struct {
+	em:  rune,
+	clr: string,
+} {
+	.Loading = {'◌', CLR_GRAY},
+	.Success = {'✓', CLR_SUCCESS},
+}
+
+print :: proc(status: Print_Status, msg: string, clear_line := false) {
+	if clear_line {
+		fmt.print("\r\x1b[2K")
+	}
+
+	p := print_preset[status]
+	fmt.printf("%s%c %s\x1b[0m", p.clr, p.em, msg)
+}
+
+printf :: proc(status: Print_Status, msg: string, args: ..any, clear_line := false) {
+	if clear_line {
+		fmt.print("\r\x1b[2K")
+	}
+
+	p := print_preset[status]
+	fmt.printf("%s%c ", p.clr, p.em)
+	fmt.printf(msg, ..args)
+	fmt.print("\x1b[0m")
+}
+
+term_enable_raw_mode :: proc() -> (old_termios: posix.termios) {
+	posix.tcgetattr(posix.STDIN_FILENO, &old_termios)
+
+	raw := old_termios
+	raw.c_lflag -= {.ECHO, .ICANON}
+	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &raw)
+
+	return
+}
+
+term_restore :: proc(old_termios: posix.termios) {
+	ot := old_termios
+	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &ot)
+}
+
 read_prompt :: proc(
 	prompt: string,
 	max_len: int,
@@ -321,14 +373,8 @@ read_prompt :: proc(
 ) {
 	fmt.printf("%s%s\x1b[0m", CLR_GRAY, prompt)
 
-	old_termios: posix.termios
-	posix.tcgetattr(posix.STDIN_FILENO, &old_termios)
-
-	raw := old_termios
-	raw.c_lflag -= {.ECHO, .ICANON}
-	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &raw)
-
-	defer posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &old_termios)
+	old_termios := term_enable_raw_mode()
+	defer term_restore(old_termios)
 
 	buf = make([]byte, len = max_len, allocator = allocator)
 	idx := 0
@@ -377,38 +423,34 @@ read_prompt :: proc(
 	return
 }
 
-Print_Status :: enum {
-	Loading,
-	Success,
-}
 
-@(rodata)
-print_preset := [Print_Status]struct {
-	em:  rune,
-	clr: string,
-} {
-	.Loading = {'◌', CLR_GRAY},
-	.Success = {'✔', CLR_SUCCESS},
-}
+read_confirmation :: proc(prompt: string) -> (result: bool, err: os.Error) {
+	fmt.printf("%s%s (press anything to confirm / n to exit) \x1b[0m", CLR_GRAY, prompt)
 
-print :: proc(status: Print_Status, msg: string, clear_line := false) {
-	if clear_line {
-		fmt.print("\r\x1b[2K")
+	old_termios := term_enable_raw_mode()
+	defer {
+		term_restore(old_termios)
+		fmt.println()
 	}
 
-	p := print_preset[status]
-	fmt.printf("%s%c %s\x1b[0m", p.clr, p.em, msg)
-}
+	chars: for {
+		ch: [1]u8
+		n := os.read(os.stdin, ch[:]) or_return
+		if n != 1 {
+			fmt.print("no")
+			return
+		}
 
-printf :: proc(status: Print_Status, msg: string, args: ..any, clear_line := false) {
-	if clear_line {
-		fmt.print("\r\x1b[2K")
+		switch ch[0] {
+		case 'n':
+			fmt.print("no")
+			return
+		case:
+			fmt.print("yes")
+			result = true
+			return
+		}
 	}
-
-	p := print_preset[status]
-	fmt.printf("%s%c ", p.clr, p.em)
-	fmt.printf(msg, ..args)
-	fmt.print("\x1b[0m")
 }
 
 main :: proc() {
@@ -469,6 +511,11 @@ main :: proc() {
 	github_access_token, gat_exists := env["GITHUB_ACCESS_TOKEN"]
 	if !gat_exists {
 		fmt.println("missing github access token")
+		return
+	}
+	openai_api_key, oaik_exists := env["OPEN_AI_API_KEY"]
+	if !oaik_exists {
+		fmt.println("missing open ai API KEY")
 		return
 	}
 
@@ -633,7 +680,7 @@ main :: proc() {
 
 	// build prompt
 
-	print(.Loading, "Building LLM prompt\n")
+	print(.Loading, "Building LLM prompt")
 
 	llm_prompt := build_prompt(
 		github_repo,
@@ -642,9 +689,6 @@ main :: proc() {
 		program_allocator,
 	)
 	free_all(temp_allocator)
-
-	fmt.print("\x1b[3A") // move up 3 lines
-	fmt.print("\x1b[0J") // erase from cursor to end of screen
 
 	prompt_size: string
 	{
@@ -666,15 +710,125 @@ main :: proc() {
 		}
 	}
 
-	printf(.Success, "Prompt built %s(Prompt size: %s)\n", RESET, prompt_size)
-	free_all(temp_allocator)
+	printf(.Success, "Prompt built %s(size: %s)\n", RESET, prompt_size, clear_line = true)
 
 	// LLM
 
 	{ 	// token count
-		// req := create_open_ai_request(temp_allocator)
+		print(.Loading, "Fetching token count")
+		defer free_all(temp_allocator)
 
+		req, err := create_open_ai_request(temp_allocator, openai_api_key, llm_prompt)
+		if err != nil {
+			fmt.println("unable to create open ai request: ", err)
+			return
+		}
 
+		url := fmt.aprintf(
+			"%s/responses/input_tokens",
+			OPEN_AI_API_URL,
+			allocator = temp_allocator,
+		)
+
+		Input_Tokens_Reponse :: struct {
+			input_tokens: int,
+		}
+		response: Input_Tokens_Reponse
+		if err := http_request(req, url, temp_allocator, program_allocator, &response);
+		   err != nil {
+			fmt.println("unable to fetch count if input tokens: ", err)
+			return
+		}
+
+		printf(.Success, "Token count: %d\n", response.input_tokens, clear_line = true)
 	}
 
+	should_continue, cerr := read_confirmation("Do you want to continue?")
+	if cerr != nil {
+		fmt.println("unable to read from stdin: ", cerr)
+		return
+	}
+
+	if !should_continue {
+		return
+	}
+
+	fmt.println(DIVIDER)
+
+	Response_Output_Content :: struct {
+		type: string,
+		text: string,
+	}
+
+	Response_Output :: struct {
+		type:    string,
+		id:      string,
+		status:  string,
+		role:    string,
+		content: []Response_Output_Content,
+	}
+
+	Create_Response_Response :: struct {
+		output: []Response_Output,
+		usage:  struct {
+			input_tokens:  int,
+			output_tokens: int,
+		},
+	}
+
+	llm_response: Create_Response_Response
+	{ 	// send prompt
+		print(.Loading, "Sending prompt")
+		defer {
+			printf(
+				.Success,
+				"LLM response received (output tokens: %d)\n",
+				llm_response.usage.output_tokens,
+				clear_line = true,
+			)
+			free_all(temp_allocator)
+		}
+
+		req, err := create_open_ai_request(temp_allocator, openai_api_key, llm_prompt)
+		if err != nil {
+			fmt.println("unable to create open ai request: ", err)
+			return
+		}
+
+		url := fmt.aprintf("%s/responses", OPEN_AI_API_URL, allocator = temp_allocator)
+
+		if err := http_request(req, url, temp_allocator, program_allocator, &llm_response);
+		   err != nil {
+			fmt.println("unable to fetch LLM response: ", err)
+			return
+		}
+	}
+
+	print(.Loading, "Saving LLM output")
+
+	exe_path := os.args[0]
+	// NOTE: temp_allocator is empty, we can ignore the error
+	out_path, _ := filepath.join(
+		{exe_path, "../out", fmt.aprintf("%s.md", github_repo, allocator = temp_allocator)},
+		temp_allocator,
+	)
+
+	out_file, oerr := os.create(out_path)
+	if oerr != nil {
+		fmt.println("unable to create out file: ", oerr)
+		return
+	}
+
+	for o in llm_response.output {
+		for content in o.content {
+			if content.type == "output_text" {
+				if _, err := os.write(out_file, transmute([]byte)content.text); err != nil {
+					fmt.println("unable to write llm output: ", err)
+					return
+				}
+			}
+		}
+	}
+
+	printf(.Success, "Saved LLM output to %s\n", out_path, clear_line = true)
 }
