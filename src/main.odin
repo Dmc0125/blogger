@@ -2,6 +2,7 @@
 package main
 
 import "base:runtime"
+import "core:bytes"
 import "core:encoding/json"
 import "core:fmt"
 import "core:mem"
@@ -9,6 +10,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
+import "core:sys/posix"
 
 import http "../vendor/odin-http"
 import http_client "../vendor/odin-http/client"
@@ -16,6 +18,7 @@ import http_client "../vendor/odin-http/client"
 PROGRAM_MEMORY: [100 * mem.Megabyte]byte
 
 GITHUB_API_URL :: "https://api.github.com"
+OPEN_AI_API_URL :: "https://api.openai.com"
 
 FILE_TEMPL :: `        %s:
             - status: %s
@@ -52,6 +55,7 @@ Write the blog post with somewhat following structure (you can modifiy the struc
 - Walk through the development chronologically
 - Group related commits into phases (e.g. "Setting up the project", "Core logic", "Polish")
 - For each phase, explain what was done and why
+- Do not reference the commits directly, like "first commit was...", incorporate it naturally
 
 ## Interesting Code
 - Pick 2-3 interesting snippets from the patches and explain them
@@ -64,9 +68,7 @@ Write the blog post with somewhat following structure (you can modifiy the struc
 - How is the codebase structured?
 - How do the pieces fit together?
 
-Write as if you're explaining to a fellow developer over coffee.
-Don't be overly formal. Don't use phrases like "In conclusion" or
-"It's worth noting". Don't use filler. Be direct.
+Write as if you're explaining to a fellow developer over coffee. Don't be overly formal. Don't use phrases like "In conclusion" or "It's worth noting". Don't use filler. Be direct. Use the author's note if it was provided to inform the blog post's narrative. Incorporate them naturally — don't just quote them verbatim. Write the blog in first person, as if you are describing your project.
 
 Do NOT:
 - Make up information that isn't in the commit data
@@ -74,15 +76,31 @@ Do NOT:
 - Use generic filler like "This was a great learning experience"
 - Explain basic programming concepts
 - Write an introduction that starts with "In today's world..."
+- Use phrases like "it's not x, it's y"`
 
-Project name: %s
+build_prompt :: proc(
+	project_name, commits, authors_note: string,
+	allocator: mem.Allocator,
+) -> string {
+	sb: strings.Builder
+	strings.builder_init(&sb, allocator)
 
-Author's notes:
-%s
+	strings.write_string(&sb, PROMPT_TEMPL)
+	strings.write_string(&sb, "\nProject name: ")
+	strings.write_string(&sb, project_name)
+	strings.write_string(&sb, "\n")
 
-Commits:
-%s
-`
+	if len(authors_note) > 0 {
+		strings.write_string(&sb, "\nAuthor's note: ")
+		strings.write_string(&sb, authors_note)
+		strings.write_string(&sb, "\n")
+	}
+
+	strings.write_string(&sb, "\nCommits:\n")
+	strings.write_string(&sb, commits)
+
+	return string(sb.buf[:])
+}
 
 create_arena :: proc(backing_allocator: mem.Allocator, size: int) -> (allocator: mem.Allocator) {
 	arena := new(mem.Arena, backing_allocator)
@@ -106,6 +124,34 @@ create_github_request :: proc(
 	http.headers_set(&req.headers, "Accept", "application/vnd.github+json")
 	http.headers_set(&req.headers, "X-GitHub-Api-Version", "2026-03-10")
 	return req
+}
+
+create_open_ai_request :: proc(
+	allocator: mem.Allocator,
+	api_key, prompt: string,
+) -> (
+	req: ^http_client.Request,
+	err: json.Marshal_Error,
+) {
+	req = new(http_client.Request, allocator)
+	http_client.request_init(req, .Post, allocator)
+	http.headers_set(&req.headers, "content-type", "application/json")
+	http.headers_set(
+		&req.headers,
+		"authorization",
+		fmt.aprintf("Bearer %s", api_key, allocator = allocator),
+	)
+
+	MODEL :: "gpt-5.1"
+	Data :: struct {
+		model: string,
+		input: string,
+	}
+
+	data_json := json.marshal(Data{model = MODEL, input = prompt}, allocator = allocator) or_return
+	bytes.buffer_init(&req.body, data_json)
+
+	return
 }
 
 Http_Request_Error :: union #shared_nil {
@@ -258,6 +304,113 @@ minify_patch :: proc(patch, status: string, allocator: mem.Allocator) -> string 
 	return ""
 }
 
+RESET :: "\x1b[0m"
+CLR_GRAY :: "\x1b[38;2;150;150;150m"
+CLR_SUCCESS :: "\x1b[38;2;17;180;72m"
+DIVIDER :: "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+read_prompt :: proc(
+	prompt: string,
+	max_len: int,
+	allocator: mem.Allocator,
+	password := false,
+) -> (
+	result: string,
+	buf: []byte,
+	err: os.Error,
+) {
+	fmt.printf("%s%s\x1b[0m", CLR_GRAY, prompt)
+
+	old_termios: posix.termios
+	posix.tcgetattr(posix.STDIN_FILENO, &old_termios)
+
+	raw := old_termios
+	raw.c_lflag -= {.ECHO, .ICANON}
+	posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &raw)
+
+	defer posix.tcsetattr(posix.STDIN_FILENO, .TCSANOW, &old_termios)
+
+	buf = make([]byte, len = max_len, allocator = allocator)
+	idx := 0
+
+	chars: for {
+		ch: [1]u8
+		n, rerr := os.read(os.stdin, ch[:])
+		if rerr != nil {
+			err = rerr
+			return
+		}
+		if n != 1 {
+			break
+		}
+
+		{
+			ch := ch[0]
+
+			switch ch {
+			case '\n', '\r':
+				// user done
+				break chars
+			case '\b', 127:
+				// backspace
+				if idx > 0 {
+					idx -= 1
+					fmt.print("\b \b")
+				}
+			case:
+				if idx < max_len {
+					buf[idx] = ch
+					idx += 1
+
+					if password {
+						fmt.print("•")
+					} else {
+						fmt.printf("%c", ch)
+					}
+				}
+			}
+		}
+	}
+
+	fmt.println()
+	result = string(buf[:idx])
+	return
+}
+
+Print_Status :: enum {
+	Loading,
+	Success,
+}
+
+@(rodata)
+print_preset := [Print_Status]struct {
+	em:  rune,
+	clr: string,
+} {
+	.Loading = {'◌', CLR_GRAY},
+	.Success = {'✔', CLR_SUCCESS},
+}
+
+print :: proc(status: Print_Status, msg: string, clear_line := false) {
+	if clear_line {
+		fmt.print("\r\x1b[2K")
+	}
+
+	p := print_preset[status]
+	fmt.printf("%s%c %s\x1b[0m", p.clr, p.em, msg)
+}
+
+printf :: proc(status: Print_Status, msg: string, args: ..any, clear_line := false) {
+	if clear_line {
+		fmt.print("\r\x1b[2K")
+	}
+
+	p := print_preset[status]
+	fmt.printf("%s%c ", p.clr, p.em)
+	fmt.printf(msg, ..args)
+	fmt.print("\x1b[0m")
+}
+
 main :: proc() {
 	context = runtime.default_context()
 
@@ -319,19 +472,38 @@ main :: proc() {
 		return
 	}
 
-	// read cli args
+	// read user input
 
-	if len(os.args) < 3 {
-		fmt.println("need to provide github owner and repo")
+	github_owner, _, goerr := read_prompt("Github repo owner: ", 100, program_allocator)
+	if goerr != nil {
+		fmt.println("unable to read from stdin: ", goerr)
+		return
+	}
+	github_repo, _, grerr := read_prompt("Github repository name: ", 100, program_allocator)
+	if grerr != nil {
+		fmt.println("unable to read from stdin: ", grerr)
+		return
+	}
+	authors_note, _, anerr := read_prompt(
+		"Author's note (can be left empty):\n",
+		1024,
+		program_allocator,
+	)
+	if anerr != nil {
+		fmt.println("unable to read from stdin: ", anerr)
 		return
 	}
 
-	github_owner := os.args[1]
-	github_repo := os.args[2]
+	// fetch github data
+
+	fmt.println(DIVIDER)
 
 	commits: []Commit
 
 	{ 	// get all commits
+		print(.Loading, "Fetching commits")
+		defer printf(.Success, "Fetched %d commits\n", len(commits), clear_line = true)
+
 		defer free_all(temp_allocator)
 
 		req := create_github_request(temp_allocator, github_access_token)
@@ -353,6 +525,14 @@ main :: proc() {
 	strings.builder_init(&commits_str, allocator = program_allocator)
 
 	#reverse for commit, i in commits {
+		printf(
+			.Loading,
+			"Fetching commit details (%d/%d)",
+			len(commits) - 1 - i,
+			len(commits),
+			clear_line = true,
+		)
+
 		defer free_all(temp_allocator)
 
 		req := create_github_request(temp_allocator, github_access_token)
@@ -449,22 +629,52 @@ main :: proc() {
 		)
 	}
 
-	prompt := fmt.aprintf(
-		PROMPT_TEMPL,
+	printf(.Success, "Fetched details for all commits (%d)\n", len(commits), clear_line = true)
+
+	// build prompt
+
+	print(.Loading, "Building LLM prompt\n")
+
+	llm_prompt := build_prompt(
 		github_repo,
 		string(commits_str.buf[:]),
-		allocator = program_allocator,
+		authors_note,
+		program_allocator,
 	)
 	free_all(temp_allocator)
 
-	out_file := os.args[3]
-	prompt_file, err := os.create(out_file)
-	if err != nil {
-		fmt.println("unable to create prompt file: ", err)
-		return
+	fmt.print("\x1b[3A") // move up 3 lines
+	fmt.print("\x1b[0J") // erase from cursor to end of screen
+
+	prompt_size: string
+	{
+		b := len(llm_prompt)
+		switch {
+		case b < mem.Kilobyte:
+			// bytes
+			prompt_size = fmt.aprintf("%db", b, allocator = temp_allocator)
+		case b < mem.Megabyte:
+			// kilobytes
+			prompt_size = fmt.aprintf("%.3fkb", f32(b) / 1024.0, allocator = temp_allocator)
+		case b < mem.Gigabyte:
+			// megabytes
+			prompt_size = fmt.aprintf(
+				"%.3fmb",
+				f32(b) / 1024.0 / 1024.0,
+				allocator = temp_allocator,
+			)
+		}
 	}
-	if _, err := os.write(prompt_file, transmute([]byte)prompt); err != nil {
-		fmt.println("unable to write to prompt file: ", err)
-		return
+
+	printf(.Success, "Prompt built %s(Prompt size: %s)\n", RESET, prompt_size)
+	free_all(temp_allocator)
+
+	// LLM
+
+	{ 	// token count
+		// req := create_open_ai_request(temp_allocator)
+
+
 	}
+
 }
