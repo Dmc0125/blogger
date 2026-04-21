@@ -70,7 +70,7 @@ Do NOT:
 - Write an introduction that starts with "In today's world..."
 - Use phrases like "it's not x, it's y"`
 
-build_prompt :: proc(
+build_blog_prompt :: proc(
 	project_name, commits, authors_note: string,
 	allocator: mem.Allocator,
 ) -> string {
@@ -90,6 +90,88 @@ build_prompt :: proc(
 
 	strings.write_string(&sb, "\nCommits:\n")
 	strings.write_string(&sb, commits)
+
+	return string(sb.buf[:])
+}
+
+README_PROMPT_TEMPL :: `You are a technical writer. You will be given the contents of a project's source files and based on that you will write a README.md for the project.
+
+File format explanation:
+- Each file is listed with its path and full content
+- Files are in no particular order
+
+Write the README with somewhat following structure (you can modify the structure however you want if it fits the project more):
+
+## Project Title
+- Clear, concise project name and one-liner description
+
+## About
+- What is this project?
+- What problem does it solve?
+
+## Features
+- Key features / capabilities of the project
+
+## Tech Stack
+- What languages/frameworks/libraries are used?
+
+## Getting Started
+- Prerequisites (runtime, tools, etc.)
+- Installation steps
+- How to run the project
+- Environment variables if any (.env, config files)
+
+## Usage
+- Basic usage examples
+- CLI arguments if applicable
+- API endpoints if applicable
+
+## Project Structure
+- Brief overview of the directory layout and what each part does
+
+Write clearly and concisely. Target audience is a developer who just found this repo and wants to understand what it does and how to run it in under 2 minutes.
+
+Do NOT:
+- Make up information that isn't in the source files
+- Invent features that don't exist in the code
+- Add badges, contribution guidelines, or license sections unless obvious from the files
+- Explain basic programming concepts
+- Write marketing fluff
+
+If the author provided notes, use them to inform the README's narrative. Incorporate them naturally — don't just quote them verbatim.`
+
+Readme_File :: struct {
+	path: string,
+	data: []byte,
+}
+
+build_readme_prompt :: proc(
+	project_name, authors_note: string,
+	files: []Readme_File,
+	allocator: mem.Allocator,
+) -> string {
+	sb: strings.Builder
+	strings.builder_init(&sb, allocator)
+
+	strings.write_string(&sb, README_PROMPT_TEMPL)
+	strings.write_string(&sb, "\n\nProject name: ")
+	strings.write_string(&sb, project_name)
+	strings.write_string(&sb, "\n")
+
+	if len(authors_note) > 0 {
+		strings.write_string(&sb, "\nAuthor's note: ")
+		strings.write_string(&sb, authors_note)
+		strings.write_string(&sb, "\n")
+	}
+
+	strings.write_string(&sb, "\nFiles:\n")
+	for file in files {
+		strings.write_string(&sb, "--- ")
+		strings.write_string(&sb, file.path)
+		strings.write_string(&sb, " ---\n")
+		strings.write_bytes(&sb, file.data)
+		strings.write_string(&sb, "\n")
+	}
 
 	return string(sb.buf[:])
 }

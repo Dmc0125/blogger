@@ -12,6 +12,24 @@ import "core:strings"
 import http "../vendor/odin-http"
 import http_client "../vendor/odin-http/client"
 
+IGNORED_DIRECTORIES :: [?]string{"vendor", "target"}
+IGNORED_SUFFIXES :: [?]string {
+	// lock files
+	".lock",
+	".lockb",
+	".sum",
+	// binaries
+	".bin",
+	".wasm",
+	".dll",
+	".so",
+	".exe",
+	// assets
+	".ttf",
+	".png",
+}
+IGNORED_FILENAMES :: [?]string{"package-lock.json"}
+
 PROGRAM_MEMORY: [100 * mem.Megabyte]byte
 
 create_arena :: proc(backing_allocator: mem.Allocator, size: int) -> (allocator: mem.Allocator) {
@@ -53,6 +71,336 @@ http_request :: proc(
 	}
 
 	return nil
+}
+
+Error_Og :: union {
+	os.Error,
+	mem.Allocator_Error,
+	Http_Request_Error,
+}
+
+Error :: struct {
+	valid: bool,
+	loc:   runtime.Source_Code_Location,
+	msg:   string,
+	og:    Error_Og,
+}
+
+error_new :: proc(og: Error_Og, msg := "", loc := #caller_location) -> (err: Error) {
+	err.valid = true
+	err.loc = loc
+	err.msg = msg
+	err.og = og
+	return
+}
+
+error_string :: proc(err: ^Error, allocator: mem.Allocator) -> string {
+	// NOTE: this function allocates duplicate memory for some strings
+	sb: strings.Builder
+	strings.builder_init(&sb, allocator)
+
+	strings.write_string(&sb, "Error at ")
+	strings.write_string(&sb, fmt.aprintf("%s: ", err.loc, allocator = allocator))
+
+	if len(err.msg) > 0 {
+		strings.write_string(&sb, err.msg)
+		strings.write_string(&sb, " ")
+	}
+
+	strings.write_string(&sb, fmt.aprintf("%s", err.og, allocator = allocator))
+	return string(sb.buf[:])
+}
+
+error_print :: proc(err: ^Error, allocator: mem.Allocator) {
+	s := error_string(err, allocator)
+	fmt.println(s)
+}
+
+error_print_new :: proc(
+	allocator: mem.Allocator,
+	og: Error_Og,
+	msg := "",
+	loc := #caller_location,
+) {
+	e := error_new(og, msg, loc)
+	error_print(&e, allocator)
+}
+
+generate_readme_prompt :: proc(
+	github_owner, github_repo, authors_note: string,
+	program_allocator, temp_allocator: mem.Allocator,
+) -> (
+	prompt: string,
+	err: Error,
+) {
+	defer free_all(temp_allocator)
+
+	// create the temp dir
+	tmp_path, tderr := os.make_directory_temp(
+		"/tmp",
+		fmt.aprintf("%s-%s", github_owner, github_repo, allocator = temp_allocator),
+		program_allocator,
+	)
+	if tderr != nil {
+		err = error_new(tderr)
+		return
+	}
+	defer {
+		if err := os.remove_all(tmp_path); err != nil {
+			fmt.println("unable to remove temp directory: ", err)
+		}
+	}
+
+	{ 	// clone the repo
+		print(.Loading, "Cloning repository")
+
+		git_url := fmt.aprintf(
+			"https://github.com/%s/%s.git",
+			github_owner,
+			github_repo,
+			allocator = temp_allocator,
+		)
+		process_desc := os.Process_Desc {
+			working_dir = tmp_path,
+			command     = {"git", "clone", "--depth", "1", git_url, "."},
+		}
+		process_state, _, stderr, perr := os.process_exec(process_desc, temp_allocator)
+		if perr != nil {
+			err = error_new(perr)
+			return
+		}
+		if !process_state.success {
+			msg := fmt.aprintf(
+				"process exited without success: %s",
+				string(stderr),
+				allocator = program_allocator,
+			)
+			err = error_new(nil, msg)
+			return
+		}
+
+		print(.Success, "Cloned repository\n", clear_line = true)
+	}
+
+	// read repo
+	print(.Loading, "Reading files and buildig prompt")
+
+	read_dir :: proc(
+		path: string,
+		files: ^[dynamic]Readme_File,
+		program_allocator, temp_allocator: mem.Allocator,
+	) -> (
+		err: Error,
+	) {
+		fis, rderr := os.read_directory_by_path(path, 0, temp_allocator)
+		if rderr != nil {
+			err = error_new(rderr)
+			return
+		}
+
+		fis_loop: for fi in fis {
+			#partial switch fi.type {
+			case .Directory:
+				if strings.has_prefix(fi.name, ".") {
+					continue fis_loop
+				}
+				for d in IGNORED_DIRECTORIES {
+					if fi.name == d {
+						continue fis_loop
+					}
+				}
+				read_dir(fi.fullpath, files, program_allocator, temp_allocator)
+			case .Regular:
+				for suffix in IGNORED_SUFFIXES {
+					if strings.has_suffix(fi.name, suffix) {
+						continue fis_loop
+					}
+				}
+				for name in IGNORED_FILENAMES {
+					if fi.name == name {
+						continue fis_loop
+					}
+				}
+
+				file_data, fderr := os.read_entire_file_from_path(fi.fullpath, program_allocator)
+				if fderr != nil {
+					msg := fmt.aprintf(
+						"unable to read file: %s",
+						fi.fullpath,
+						allocator = program_allocator,
+					)
+					err = error_new(fderr, msg)
+					return
+				}
+
+				file_path, aerr := strings.clone(fi.fullpath, program_allocator)
+				if aerr != nil {
+					err = error_new(aerr)
+					return
+				}
+
+				append(files, Readme_File{path = file_path, data = file_data})
+			}
+		}
+
+		return
+	}
+
+	files := make([dynamic]Readme_File, allocator = program_allocator)
+	if err = read_dir(tmp_path, &files, program_allocator, temp_allocator); err.valid {
+		return
+	}
+
+	for file, i in files {
+		files[i].path = file.path[len(tmp_path):]
+	}
+
+	prompt = build_readme_prompt(github_repo, authors_note, files[:], program_allocator)
+	return
+}
+
+generate_blogpost_prompt :: proc(
+	github_owner, github_repo, authors_note: string,
+	github_access_token: string,
+	openai_api_key: string,
+	program_allocator, temp_allocator: mem.Allocator,
+) -> (
+	llm_prompt: string,
+	err: Error,
+) {
+	defer free_all(temp_allocator)
+
+	// fetch github data
+
+	commits: []Commit
+
+	{ 	// get all commits
+		print(.Loading, "Fetching commits")
+		defer printf(.Success, "Fetched %d commits\n", len(commits), clear_line = true)
+
+		req := create_github_request(temp_allocator, github_access_token)
+		url := fmt.aprintf(
+			"%s/repos/%s/%s/commits",
+			GITHUB_API_URL,
+			github_owner,
+			github_repo,
+			allocator = temp_allocator,
+		)
+
+		if rerr := http_request(req, url, temp_allocator, program_allocator, &commits);
+		   rerr != nil {
+			err = error_new(rerr)
+			return
+		}
+	}
+
+	commits_str: strings.Builder
+	strings.builder_init(&commits_str, allocator = program_allocator)
+
+	#reverse for commit, i in commits {
+		printf(
+			.Loading,
+			"Fetching commit details (%d/%d)",
+			len(commits) - 1 - i,
+			len(commits),
+			clear_line = true,
+		)
+
+		defer free_all(temp_allocator)
+
+		req := create_github_request(temp_allocator, github_access_token)
+		url := fmt.aprintf(
+			"%s/repos/%s/%s/commits/%s",
+			GITHUB_API_URL,
+			github_owner,
+			github_repo,
+			commit.sha,
+			allocator = temp_allocator,
+		)
+
+		details: Commit_Details
+		if rerr := http_request(req, url, temp_allocator, program_allocator, &details);
+		   rerr != nil {
+			err = error_new(rerr)
+			return
+		}
+
+		files_str: strings.Builder
+		strings.builder_init(&files_str, allocator = temp_allocator)
+
+		file_loop: for file, i in details.files {
+			for dir in IGNORED_DIRECTORIES {
+				if strings.contains(
+					file.filename,
+					fmt.aprintf("%s/", dir, allocator = temp_allocator),
+				) {
+					continue file_loop
+				}
+			}
+
+
+			skip_patch: bool
+			for suffix in IGNORED_SUFFIXES {
+				if strings.has_suffix(file.filename, suffix) {
+					skip_patch = true
+					break
+				}
+			}
+			if !skip_patch {
+				for filename in IGNORED_FILENAMES {
+					if filename == file.filename {
+						skip_patch = true
+						break
+					}
+				}
+			}
+
+			patch: string
+			if !skip_patch {
+				patch = minify_patch(file.patch, file.status, temp_allocator)
+			}
+
+			str := fmt.aprintf(
+				FILE_TEMPL,
+				file.filename,
+				file.status,
+				file.additions,
+				file.deletions,
+				patch,
+				allocator = temp_allocator,
+			)
+			strings.write_string(&files_str, str)
+		}
+
+		strings.write_string(
+			&commits_str,
+			fmt.aprintf(
+				COMMIT_TEMPL,
+				details.commit.author.date,
+				details.commit.author.name,
+				commit.commit.message,
+				details.stats.additions,
+				details.stats.deletions,
+				string(files_str.buf[:]),
+				allocator = temp_allocator,
+			),
+		)
+	}
+
+	printf(.Success, "Fetched details for all commits (%d)\n", len(commits), clear_line = true)
+
+	// build prompt
+
+	print(.Loading, "Building LLM prompt")
+
+	llm_prompt = build_blog_prompt(
+		github_repo,
+		string(commits_str.buf[:]),
+		authors_note,
+		program_allocator,
+	)
+
+	return
 }
 
 main :: proc() {
@@ -123,6 +471,11 @@ main :: proc() {
 
 	// read user input
 
+	choice, cherr := read_choice("What do you want to create?", {"Blogpost", "Readme"})
+	if cherr != nil {
+		fmt.println("unable to read from stdin: ", cherr)
+		return
+	}
 	github_owner, _, goerr := read_prompt("Github repo owner: ", 100, program_allocator)
 	if goerr != nil {
 		fmt.println("unable to read from stdin: ", goerr)
@@ -143,154 +496,36 @@ main :: proc() {
 		return
 	}
 
-	// fetch github data
-
 	fmt.println(DIVIDER)
 
-	commits: []Commit
+	err: Error
+	llm_prompt: string
 
-	{ 	// get all commits
-		print(.Loading, "Fetching commits")
-		defer printf(.Success, "Fetched %d commits\n", len(commits), clear_line = true)
-
-		defer free_all(temp_allocator)
-
-		req := create_github_request(temp_allocator, github_access_token)
-		url := fmt.aprintf(
-			"%s/repos/%s/%s/commits",
-			GITHUB_API_URL,
+	switch choice {
+	case "Readme":
+		llm_prompt, err = generate_readme_prompt(
 			github_owner,
 			github_repo,
-			allocator = temp_allocator,
+			authors_note,
+			program_allocator,
+			temp_allocator,
 		)
-
-		if err := http_request(req, url, temp_allocator, program_allocator, &commits); err != nil {
-			fmt.println("unable to fetch commits: ", err)
-			return
-		}
-	}
-
-	commits_str: strings.Builder
-	strings.builder_init(&commits_str, allocator = program_allocator)
-
-	#reverse for commit, i in commits {
-		printf(
-			.Loading,
-			"Fetching commit details (%d/%d)",
-			len(commits) - 1 - i,
-			len(commits),
-			clear_line = true,
-		)
-
-		defer free_all(temp_allocator)
-
-		req := create_github_request(temp_allocator, github_access_token)
-		url := fmt.aprintf(
-			"%s/repos/%s/%s/commits/%s",
-			GITHUB_API_URL,
+	case "Blogpost":
+		llm_prompt, err = generate_blogpost_prompt(
 			github_owner,
 			github_repo,
-			commit.sha,
-			allocator = temp_allocator,
-		)
-
-		details: Commit_Details
-		if err := http_request(req, url, temp_allocator, program_allocator, &details); err != nil {
-			fmt.printfln("unable to fetch commit details for %s: %s", commit.sha, err)
-			return
-		}
-
-		files_str: strings.Builder
-		strings.builder_init(&files_str, allocator = temp_allocator)
-
-		file_loop: for file, i in details.files {
-			ignore_directories :: [?]string{"vendor", "target"}
-			for dir in ignore_directories {
-				if strings.contains(
-					file.filename,
-					fmt.aprintf("%s/", dir, allocator = temp_allocator),
-				) {
-					continue file_loop
-				}
-			}
-
-
-			ignore_suffixes :: [?]string {
-				// lock files
-				".lock",
-				".lockb",
-				".sum",
-				// binaries
-				".bin",
-				".wasm",
-				".dll",
-				".so",
-				".exe",
-			}
-			ignore_filenames :: [?]string{"package-lock.json"}
-			skip_patch: bool
-
-			for suffix in ignore_suffixes {
-				if strings.has_suffix(file.filename, suffix) {
-					skip_patch = true
-					break
-				}
-			}
-
-			if !skip_patch {
-				for filename in ignore_filenames {
-					if filename == file.filename {
-						skip_patch = true
-						break
-					}
-				}
-			}
-
-			patch: string
-			if !skip_patch {
-				patch = minify_patch(file.patch, file.status, temp_allocator)
-			}
-
-			str := fmt.aprintf(
-				FILE_TEMPL,
-				file.filename,
-				file.status,
-				file.additions,
-				file.deletions,
-				patch,
-				allocator = temp_allocator,
-			)
-			strings.write_string(&files_str, str)
-		}
-
-		strings.write_string(
-			&commits_str,
-			fmt.aprintf(
-				COMMIT_TEMPL,
-				details.commit.author.date,
-				details.commit.author.name,
-				commit.commit.message,
-				details.stats.additions,
-				details.stats.deletions,
-				string(files_str.buf[:]),
-				allocator = temp_allocator,
-			),
+			authors_note,
+			github_access_token,
+			openai_api_key,
+			program_allocator,
+			temp_allocator,
 		)
 	}
 
-	printf(.Success, "Fetched details for all commits (%d)\n", len(commits), clear_line = true)
-
-	// build prompt
-
-	print(.Loading, "Building LLM prompt")
-
-	llm_prompt := build_prompt(
-		github_repo,
-		string(commits_str.buf[:]),
-		authors_note,
-		program_allocator,
-	)
-	free_all(temp_allocator)
+	if err.valid {
+		fmt.println(error_string(&err, program_allocator))
+		return
+	}
 
 	prompt_size: string
 	{
@@ -406,18 +641,40 @@ main :: proc() {
 		}
 	}
 
-	print(.Loading, "Saving LLM output")
 
 	exe_path := os.args[0]
 	// NOTE: temp_allocator is empty, we can ignore the error
-	out_path, _ := filepath.join(
-		{exe_path, "../out", fmt.aprintf("%s.md", github_repo, allocator = temp_allocator)},
-		temp_allocator,
+	out_filename := fmt.aprintf(
+		"%s-%s.md",
+		github_repo,
+		strings.to_lower(choice, temp_allocator),
+		allocator = temp_allocator,
 	)
+	out_path, _ := filepath.join({exe_path, "../out", out_filename}, temp_allocator)
+
+	out_path_ok, operr := read_confirmation(
+		fmt.aprintf(
+			"Do you want to save the output to: %s?",
+			out_path,
+			allocator = temp_allocator,
+		),
+	)
+	if operr != nil {
+		error_print_new(program_allocator, operr)
+		return
+	}
+	if !out_path_ok {
+		err: os.Error
+		out_path, _, err = read_prompt("Output file path: ", 100, temp_allocator)
+		if err != nil {
+			error_print_new(program_allocator, err)
+			return
+		}
+	}
 
 	out_file, oerr := os.create(out_path)
 	if oerr != nil {
-		fmt.println("unable to create out file: ", oerr)
+		error_print_new(program_allocator, oerr)
 		return
 	}
 
@@ -425,12 +682,13 @@ main :: proc() {
 		for content in o.content {
 			if content.type == "output_text" {
 				if _, err := os.write(out_file, transmute([]byte)content.text); err != nil {
-					fmt.println("unable to write llm output: ", err)
+					error_print_new(program_allocator, err)
 					return
 				}
 			}
 		}
 	}
 
-	printf(.Success, "Saved LLM output to %s\n", out_path, clear_line = true)
+	printf(.Success, "%s generated\n", choice)
+	fmt.printfln("Saved LLM output to: %s", out_path)
 }

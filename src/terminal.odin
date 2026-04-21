@@ -7,6 +7,7 @@ import "core:sys/posix"
 
 RESET :: "\x1b[0m"
 CLR_GRAY :: "\x1b[38;2;150;150;150m"
+CLR_DARK_GRAY :: "\x1b[38;2;110;110;110m"
 CLR_SUCCESS :: "\x1b[38;2;17;180;72m"
 DIVIDER :: "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
@@ -122,7 +123,7 @@ read_prompt :: proc(
 }
 
 read_confirmation :: proc(prompt: string) -> (result: bool, err: os.Error) {
-	fmt.printf("%s%s (press anything to confirm / n to exit) \x1b[0m", CLR_GRAY, prompt)
+	fmt.printf("%s%s (press anything for yes/ n for no) \x1b[0m", CLR_GRAY, prompt)
 
 	old_termios := term_enable_raw_mode()
 	defer {
@@ -147,5 +148,53 @@ read_confirmation :: proc(prompt: string) -> (result: bool, err: os.Error) {
 			result = true
 			return
 		}
+	}
+}
+
+read_choice :: proc(prompt: string, choices: []string) -> (chosen: string, err: os.Error) {
+	fmt.printf("%s%s %s(j down / k up / enter submit) \x1b[0m\n", CLR_GRAY, prompt, CLR_DARK_GRAY)
+
+	old_termios := term_enable_raw_mode()
+	defer term_restore(old_termios)
+
+	selected := -1
+
+	for {
+		for c, i in choices {
+			if i == selected {
+				fmt.printfln("● %s", c)
+			} else {
+				fmt.printfln("○ %s", c)
+			}
+		}
+
+		ch: [1]u8
+		n := os.read(os.stdin, ch[:]) or_return
+		if n != 1 {
+			return
+		}
+
+		switch ch[0] {
+		case 'j':
+			if selected < len(choices) - 1 {
+				selected += 1
+			} else {
+				selected = 0
+			}
+		case 'k':
+			if selected > 0 {
+				selected -= 1
+			} else {
+				selected = len(choices) - 1
+			}
+		case 10:
+			if selected > 0 && selected < len(choices) {
+				chosen = choices[selected]
+				return
+			}
+		}
+
+		fmt.print("\x1b[2A") // move up 2 lines
+		fmt.print("\x1b[0J") // erase from cursor to end of screen
 	}
 }
