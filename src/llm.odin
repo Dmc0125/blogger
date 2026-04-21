@@ -1,13 +1,7 @@
 package main
 
-import "core:bytes"
-import "core:encoding/json"
-import "core:fmt"
 import "core:mem"
 import "core:strings"
-
-import http "../vendor/odin-http"
-import http_client "../vendor/odin-http/client"
 
 OPEN_AI_API_URL :: "https://api.openai.com/v1"
 
@@ -174,32 +168,4 @@ build_readme_prompt :: proc(
 	}
 
 	return string(sb.buf[:])
-}
-
-create_open_ai_request :: proc(
-	allocator: mem.Allocator,
-	api_key, prompt: string,
-) -> (
-	req: ^http_client.Request,
-	err: json.Marshal_Error,
-) {
-	req = new(http_client.Request, allocator)
-	http_client.request_init(req, .Post, allocator)
-	http.headers_set(&req.headers, "content-type", "application/json")
-	http.headers_set(
-		&req.headers,
-		"authorization",
-		fmt.aprintf("Bearer %s", api_key, allocator = allocator),
-	)
-
-	MODEL :: "gpt-5.1"
-	Data :: struct {
-		model: string,
-		input: string,
-	}
-
-	data_json := json.marshal(Data{model = MODEL, input = prompt}, allocator = allocator) or_return
-	bytes.buffer_init(&req.body, data_json)
-
-	return
 }

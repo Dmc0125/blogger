@@ -4,12 +4,12 @@ package main
 import "base:runtime"
 import "core:encoding/json"
 import "core:fmt"
+import "core:log"
 import "core:mem"
 import "core:os"
 import "core:path/filepath"
 import "core:strings"
 
-import http "../vendor/odin-http"
 import http_client "../vendor/odin-http/client"
 
 IGNORED_DIRECTORIES :: [?]string{"vendor", "target"}
@@ -40,43 +40,31 @@ create_arena :: proc(backing_allocator: mem.Allocator, size: int) -> (allocator:
 	return
 }
 
-Http_Request_Error :: union #shared_nil {
-	http_client.Error,
-	http_client.Body_Error,
-	json.Unmarshal_Error,
-}
-
-http_request :: proc(
-	request: ^http_client.Request,
-	url: string,
-	http_allocator, data_allocator: mem.Allocator,
-	data: ^$T,
-	log := false,
-) -> Http_Request_Error {
-	res := http_client.request(request, url, http_allocator) or_return
-	body, _ := http_client.response_body(&res, allocator = http_allocator) or_return
-
-	// TODO: handle response status not ok
-
-	if log {
-		fmt.println("Headers: ", res.headers)
-		fmt.println("Body: ", body)
-	}
-
-	#partial switch b in body {
-	case http_client.Body_Plain:
-		json.unmarshal_string(b, data, allocator = data_allocator) or_return
-	case:
-		assert(false, "unimplemented")
-	}
-
-	return nil
-}
-
 Error_Og :: union {
 	os.Error,
 	mem.Allocator_Error,
-	Http_Request_Error,
+	Http_Error,
+	Http_Request_Err,
+}
+
+error_og_string :: proc(err: Error_Og) -> string {
+	if err == nil {
+		return "Unknown"
+	}
+
+	switch e in err {
+	case os.Error:
+		return os.error_string(e)
+	case mem.Allocator_Error, Http_Error:
+		scratch: [256]byte
+		scratch_arena: mem.Arena
+		mem.arena_init(&scratch_arena, scratch[:])
+		return fmt.aprintf("%s", e, allocator = mem.arena_allocator(&scratch_arena))
+	case Http_Request_Err:
+		return "Request response status not ok"
+	}
+
+	return ""
 }
 
 Error :: struct {
@@ -94,36 +82,44 @@ error_new :: proc(og: Error_Og, msg := "", loc := #caller_location) -> (err: Err
 	return
 }
 
-error_string :: proc(err: ^Error, allocator: mem.Allocator) -> string {
-	// NOTE: this function allocates duplicate memory for some strings
-	sb: strings.Builder
-	strings.builder_init(&sb, allocator)
-
-	strings.write_string(&sb, "Error at ")
-	strings.write_string(&sb, fmt.aprintf("%s: ", err.loc, allocator = allocator))
+error_fatal :: proc(err: ^Error) {
+	// print error with this format:
+	//
+	// Error: <og>
+	//  --> <loc>
+	//
+	// <msg>
+	//
+	// <details>
+	fmt.fprintln(os.stderr, "\n\n\x1b[1;31mError: \x1b[0m", error_og_string(err.og))
+	fmt.fprintln(os.stderr, "\x1b[1;36m --> \x1b[0m", err.loc)
 
 	if len(err.msg) > 0 {
-		strings.write_string(&sb, err.msg)
-		strings.write_string(&sb, " ")
+		fmt.fprintln(os.stderr)
+		fmt.fprintln(os.stderr, err.msg)
 	}
 
-	strings.write_string(&sb, fmt.aprintf("%s", err.og, allocator = allocator))
-	return string(sb.buf[:])
+	if req_err, ok := err.og.(Http_Request_Err); ok {
+		fmt.fprintln(os.stderr)
+		fmt.fprintln(os.stderr, "Calling: ", req_err.method, req_err.url)
+		fmt.fprintln(os.stderr, "Status: ", req_err.status)
+		fmt.fprintln(os.stderr, "Headers: ", req_err.headers)
+		fmt.fprintln(os.stderr, "Body: ", req_err.body)
+	}
+
+	log_filename_raw := cast(^[]rawptr)context.user_ptr
+	log_filename := strings.string_from_ptr(
+		cast([^]u8)log_filename_raw[0],
+		int(uintptr(log_filename_raw[1])),
+	)
+	fmt.fprintln(os.stderr, "\nLogs are saved in: ", log_filename)
+
+	os.exit(1)
 }
 
-error_print :: proc(err: ^Error, allocator: mem.Allocator) {
-	s := error_string(err, allocator)
-	fmt.println(s)
-}
-
-error_print_new :: proc(
-	allocator: mem.Allocator,
-	og: Error_Og,
-	msg := "",
-	loc := #caller_location,
-) {
-	e := error_new(og, msg, loc)
-	error_print(&e, allocator)
+error_fatal_new :: proc(og: Error_Og, msg := "", loc := #caller_location) {
+	err := error_new(og, msg, loc)
+	error_fatal(&err)
 }
 
 generate_readme_prompt :: proc(
@@ -287,9 +283,13 @@ generate_blogpost_prompt :: proc(
 			allocator = temp_allocator,
 		)
 
-		if rerr := http_request(req, url, temp_allocator, program_allocator, &commits);
-		   rerr != nil {
+		res, rerr := http_request(req, url, temp_allocator, program_allocator, &commits)
+		if rerr != nil {
 			err = error_new(rerr)
+			return
+		}
+		if res_err, ok := res.(Http_Request_Err); ok {
+			err = error_new(res_err)
 			return
 		}
 	}
@@ -319,11 +319,17 @@ generate_blogpost_prompt :: proc(
 		)
 
 		details: Commit_Details
-		if rerr := http_request(req, url, temp_allocator, program_allocator, &details);
-		   rerr != nil {
+
+		req_result, rerr := http_request(req, url, temp_allocator, program_allocator, &details)
+		if rerr != nil {
 			err = error_new(rerr)
 			return
 		}
+		if req_err, ok := req_result.(Http_Request_Err); ok {
+			err = error_new(req_err)
+			return
+		}
+
 
 		files_str: strings.Builder
 		strings.builder_init(&files_str, allocator = temp_allocator)
@@ -409,11 +415,26 @@ main :: proc() {
 	program_arena: mem.Arena
 	mem.arena_init(&program_arena, PROGRAM_MEMORY[:])
 	program_allocator := mem.arena_allocator(&program_arena)
-
 	temp_allocator := create_arena(program_allocator, 10 * mem.Megabyte)
 
-	env := make(map[string]string, allocator = program_allocator)
+	// logger
 
+	log_file, lferr := os.create_temp_file("", "logs_")
+	if lferr != nil {
+		error_fatal_new(lferr)
+	}
+	defer os.close(log_file)
+
+	context.logger = log.create_file_logger(
+		log_file,
+		.Debug,
+		{.Level, .Date, .Time, .Short_File_Path, .Line, .Procedure},
+		allocator = program_allocator,
+	)
+	log_filename := os.name(log_file)
+	context.user_ptr = &[]rawptr{raw_data(log_filename), rawptr(uintptr(len(log_filename)))}
+
+	env := make(map[string]string, allocator = program_allocator)
 	{ 	// read .env
 		wd, wd_err := os.get_working_directory(program_allocator)
 		if wd_err != nil {
@@ -522,9 +543,10 @@ main :: proc() {
 		)
 	}
 
+	log.infof("LLM prompt: %s", llm_prompt)
+
 	if err.valid {
-		fmt.println(error_string(&err, program_allocator))
-		return
+		error_fatal(&err)
 	}
 
 	prompt_size: string
@@ -571,10 +593,14 @@ main :: proc() {
 			input_tokens: int,
 		}
 		response: Input_Tokens_Reponse
-		if err := http_request(req, url, temp_allocator, program_allocator, &response);
-		   err != nil {
+
+		req_result, rerr := http_request(req, url, temp_allocator, program_allocator, &response)
+		if err != nil {
 			fmt.println("unable to fetch count if input tokens: ", err)
 			return
+		}
+		if req_err, ok := req_result.(Http_Request_Err); ok {
+			error_fatal_new(req_err)
 		}
 
 		printf(.Success, "Token count: %d\n", response.input_tokens, clear_line = true)
@@ -634,13 +660,21 @@ main :: proc() {
 
 		url := fmt.aprintf("%s/responses", OPEN_AI_API_URL, allocator = temp_allocator)
 
-		if err := http_request(req, url, temp_allocator, program_allocator, &llm_response);
-		   err != nil {
+		req_result, rerr := http_request(
+			req,
+			url,
+			temp_allocator,
+			program_allocator,
+			&llm_response,
+		)
+		if rerr != nil {
 			fmt.println("unable to fetch LLM response: ", err)
 			return
 		}
+		if req_err, ok := req_result.(Http_Request_Err); ok {
+			error_fatal_new(req_err)
+		}
 	}
-
 
 	exe_path := os.args[0]
 	// NOTE: temp_allocator is empty, we can ignore the error
@@ -660,30 +694,26 @@ main :: proc() {
 		),
 	)
 	if operr != nil {
-		error_print_new(program_allocator, operr)
-		return
+		error_fatal_new(operr)
 	}
 	if !out_path_ok {
 		err: os.Error
 		out_path, _, err = read_prompt("Output file path: ", 100, temp_allocator)
 		if err != nil {
-			error_print_new(program_allocator, err)
-			return
+			error_fatal_new(err)
 		}
 	}
 
 	out_file, oerr := os.create(out_path)
 	if oerr != nil {
-		error_print_new(program_allocator, oerr)
-		return
+		error_fatal_new(oerr)
 	}
 
 	for o in llm_response.output {
 		for content in o.content {
 			if content.type == "output_text" {
 				if _, err := os.write(out_file, transmute([]byte)content.text); err != nil {
-					error_print_new(program_allocator, err)
-					return
+					error_fatal_new(err)
 				}
 			}
 		}
