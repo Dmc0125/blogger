@@ -188,7 +188,7 @@ read_choice :: proc(prompt: string, choices: []string) -> (chosen: string, err: 
 				selected = len(choices) - 1
 			}
 		case 10:
-			if selected > 0 && selected < len(choices) {
+			if selected >= 0 && selected < len(choices) {
 				chosen = choices[selected]
 				return
 			}

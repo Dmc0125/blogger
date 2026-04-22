@@ -434,60 +434,115 @@ main :: proc() {
 	log_filename := os.name(log_file)
 	context.user_ptr = &[]rawptr{raw_data(log_filename), rawptr(uintptr(len(log_filename)))}
 
-	env := make(map[string]string, allocator = program_allocator)
-	{ 	// read .env
-		wd, wd_err := os.get_working_directory(program_allocator)
-		if wd_err != nil {
-			fmt.println("unable to get working directory: ", wd_err)
-			return
-		}
+	github_access_token: string
+	openai_api_key: string
 
+	{ 	// setup config
 		defer free_all(temp_allocator)
 
-		dotenv_path, dotenv_err := filepath.join([]string{wd, ".env"}, temp_allocator)
-		if dotenv_err != nil {
-			fmt.println("unable to join dotenv path: ", dotenv_err)
-			return
+		os_config_dir, cderr := os.user_config_dir(temp_allocator)
+		if cderr != nil {
+			error_fatal_new(cderr)
 		}
+		config_dir_path, _ := filepath.join({os_config_dir, "blogger"}, temp_allocator)
+		config_file_path, _ := filepath.join({config_dir_path, "config.txt"}, temp_allocator)
 
-		dotenv_file_data, ferr := os.read_entire_file_from_path(dotenv_path, temp_allocator)
-		if ferr != nil {
-			fmt.println("unable to read .env: ", ferr)
-			return
-		}
-
-		start: int
-		key: string
-		for b, i in dotenv_file_data {
-			switch {
-			case b == '=':
-				if start < i {
-					key = strings.clone(string(dotenv_file_data[start:i]), program_allocator)
+		config_file_data, cferr := os.read_entire_file_from_path(config_file_path, temp_allocator)
+		switch cferr {
+		case .Not_Exist:
+			// setup config
+			if mderr := os.make_directory(config_dir_path); mderr != nil {
+				switch mderr {
+				case .Exist:
+				case:
+					error_fatal_new(mderr)
 				}
-				start = i + 1
-			// save keyval if byte == '\n' or if it's the last byte and key is set
-			case b == '\n', i == len(dotenv_file_data) - 1 && key != "":
-				if start < i {
-					val := strings.clone(string(dotenv_file_data[start:i]), program_allocator)
+			}
+
+			err: os.Error
+			if github_access_token, _, err = read_prompt(
+				"Github access token: ",
+				100,
+				program_allocator,
+				true,
+			); err != nil {
+				error_fatal_new(err)
+			}
+			if openai_api_key, _, err = read_prompt(
+				"Open ai API key: ",
+				256,
+				program_allocator,
+				true,
+			); err != nil {
+				error_fatal_new(err)
+			}
+
+			data := fmt.aprintf(
+				"github_access_token=%s\nopenai_api_key=%s",
+				github_access_token,
+				openai_api_key,
+				allocator = temp_allocator,
+			)
+
+			config_file, cferr := os.create(config_file_path)
+			if cferr != nil {
+				error_fatal_new(cferr)
+			}
+			defer os.close(config_file)
+
+			if _, err = os.write(config_file, transmute([]byte)data); err != nil {
+				error_fatal_new(err)
+			}
+
+			printf(.Success, "Saved config to %s\n", config_file_path)
+			fmt.println(DIVIDER)
+		case nil:
+			// read config
+			config := make(map[string]string, allocator = temp_allocator)
+
+			start: int
+			key: string
+			for b, i in config_file_data {
+				switch {
+				case b == '=':
+					if start < i {
+						key = strings.clone(string(config_file_data[start:i]), temp_allocator)
+					}
 					start = i + 1
-					if key != "" {
-						env[key] = val
-						key = ""
+				// save keyval if byte == '\n' or if it's the last byte and key is set
+				case b == '\n':
+					if start < i {
+						val := strings.clone(string(config_file_data[start:i]), program_allocator)
+						start = i + 1
+						if key != "" {
+							config[key] = val
+							key = ""
+						}
+					}
+				case i == len(config_file_data) - 1 && key != "":
+					if start < i {
+						val := strings.clone(
+							string(config_file_data[start:i + 1]),
+							program_allocator,
+						)
+						if key != "" {
+							config[key] = val
+							key = ""
+						}
 					}
 				}
 			}
-		}
-	}
 
-	github_access_token, gat_exists := env["GITHUB_ACCESS_TOKEN"]
-	if !gat_exists {
-		fmt.println("missing github access token")
-		return
-	}
-	openai_api_key, oaik_exists := env["OPEN_AI_API_KEY"]
-	if !oaik_exists {
-		fmt.println("missing open ai API KEY")
-		return
+			ok: bool
+			if github_access_token, ok = config["github_access_token"]; !ok {
+				error_fatal_new(nil, "Missing github access token")
+			}
+			if openai_api_key, ok = config["openai_api_key"]; !ok {
+				error_fatal_new(nil, "Missing github access token")
+			}
+		case:
+			error_fatal_new(cferr)
+		}
 	}
 
 	// read user input

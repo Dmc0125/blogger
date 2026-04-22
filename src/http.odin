@@ -25,7 +25,7 @@ create_open_ai_request :: proc(
 		fmt.aprintf("Bearer %s", api_key, allocator = allocator),
 	)
 
-	MODEL :: "gpt-5.1"
+	MODEL :: "gpt-5.4"
 	Data :: struct {
 		model: string,
 		input: string,
