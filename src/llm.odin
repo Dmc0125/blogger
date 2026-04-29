@@ -1,9 +1,364 @@
 package main
 
+import "core:bytes"
+import "core:encoding/json"
+import "core:fmt"
+import "core:log"
 import "core:mem"
 import "core:strings"
 
+import http "../vendor/odin-http"
+import http_client "../vendor/odin-http/client"
+
 OPEN_AI_API_URL :: "https://api.openai.com/v1"
+ANTHROPIC_API_URL :: "https://api.anthropic.com/v1"
+
+OPEN_AI_MODEL :: "gpt-5.4"
+ANTHROPIC_AI_MODEL :: "claude-sonnet-4-6"
+
+LLM_Provider :: enum {
+	Open_Ai,
+	Anthropic,
+}
+
+LLM_Provider_Get_Token_Count :: #type proc(
+	config: ^LLM_Provider_Config,
+	api_key, input: string,
+	program_allocator, temp_allocator: mem.Allocator,
+) -> (
+	token_count: int,
+	err: Error,
+)
+
+LLM_Provider_Send_Prompt :: #type proc(
+	config: ^LLM_Provider_Config,
+	api_key, input: string,
+	program_allocator, temp_allocator: mem.Allocator,
+) -> (
+	message: string,
+	output_tokens: int,
+	err: Error,
+)
+
+LLM_Provider_Config :: struct {
+	api_url_token_count:    string,
+	api_url_create_message: string,
+	model:                  string,
+	get_token_count:        LLM_Provider_Get_Token_Count,
+	send_prompt:            LLM_Provider_Send_Prompt,
+}
+
+@(rodata)
+llm_providers := [LLM_Provider]LLM_Provider_Config {
+	.Open_Ai = {
+		api_url_token_count    = OPEN_AI_API_URL + "/responses/input_tokens", //
+		api_url_create_message = OPEN_AI_API_URL + "/responses",
+		model                  = OPEN_AI_MODEL,
+		get_token_count        = open_ai_get_token_count,
+		send_prompt            = open_ai_send_prompt,
+	},
+	.Anthropic = {
+		api_url_token_count    = ANTHROPIC_API_URL + "/messages/count_tokens", //
+		api_url_create_message = ANTHROPIC_API_URL + "/messages",
+		model                  = ANTHROPIC_AI_MODEL,
+		get_token_count        = anthropic_get_token_count,
+		send_prompt            = anthropic_send_prompt,
+	},
+}
+
+open_ai_create_request :: proc(
+	allocator: mem.Allocator,
+	api_key, model, input: string,
+) -> (
+	req: ^http_client.Request,
+	err: json.Marshal_Error,
+) {
+	req = new(http_client.Request, allocator)
+	http_client.request_init(req, .Post, allocator)
+	http.headers_set(&req.headers, "content-type", "application/json")
+	http.headers_set(
+		&req.headers,
+		"authorization",
+		fmt.aprintf("Bearer %s", api_key, allocator = allocator),
+	)
+
+	Data :: struct {
+		model: string,
+		input: string,
+	}
+
+	data_json := json.marshal(Data{model, input}, allocator = allocator) or_return
+	log.infof("%s LLM Request data: %s", LLM_Provider.Open_Ai, string(data_json))
+	bytes.buffer_init(&req.body, data_json)
+
+	return
+}
+
+open_ai_get_token_count :: proc(
+	config: ^LLM_Provider_Config,
+	api_key, input: string,
+	program_allocator, temp_allocator: mem.Allocator,
+) -> (
+	token_count: int,
+	err: Error,
+) {
+	req, rerr := open_ai_create_request(temp_allocator, api_key, config.model, input)
+	if rerr != nil {
+		err = error_new(rerr)
+		return
+	}
+
+	Input_Tokens_Response :: struct {
+		input_tokens: int,
+	}
+	response: Input_Tokens_Response
+
+	result, herr := http_request(
+		req,
+		config.api_url_token_count,
+		temp_allocator,
+		program_allocator,
+		&response,
+	)
+	if herr != nil {
+		err = error_new(herr)
+		return
+	}
+	if herr, ok := result.(Http_Request_Err); ok {
+		err = error_new(herr)
+		return
+	}
+
+	token_count = response.input_tokens
+
+	return
+}
+
+open_ai_send_prompt :: proc(
+	config: ^LLM_Provider_Config,
+	api_key, input: string,
+	program_allocator, temp_allocator: mem.Allocator,
+) -> (
+	message: string,
+	output_tokens: int,
+	err: Error,
+) {
+	req, rerr := open_ai_create_request(temp_allocator, api_key, config.model, input)
+	if rerr != nil {
+		err = error_new(rerr)
+		return
+	}
+
+	Response_Output_Content :: struct {
+		type: string,
+		text: string,
+	}
+
+	Response_Output :: struct {
+		type:    string,
+		id:      string,
+		status:  string,
+		role:    string,
+		content: []Response_Output_Content,
+	}
+
+	Create_Response_Response :: struct {
+		output: []Response_Output,
+		usage:  struct {
+			input_tokens:  int,
+			output_tokens: int,
+		},
+	}
+
+	response: Create_Response_Response
+
+	result, herr := http_request(
+		req,
+		config.api_url_create_message,
+		temp_allocator,
+		program_allocator,
+		&response,
+	)
+	if herr != nil {
+		err = error_new(herr)
+		return
+	}
+	if herr, ok := result.(Http_Request_Err); ok {
+		err = error_new(herr)
+		return
+	}
+
+	found := false
+	outer: for o in response.output {
+		for content in o.content {
+			if content.type == "output_text" {
+				message = content.text
+				found = true
+				break outer
+			}
+		}
+	}
+	if !found {
+		err = error_new(nil, "missing output_text in open ai response")
+	}
+
+	output_tokens = response.usage.output_tokens
+
+	return
+}
+
+anthropic_create_request :: proc(
+	allocator: mem.Allocator,
+	api_key: string,
+) -> (
+	req: ^http_client.Request,
+) {
+	req = new(http_client.Request, allocator)
+	http_client.request_init(req, .Post, allocator)
+	http.headers_set(&req.headers, "content-type", "application/json")
+	http.headers_set(&req.headers, "x-api-key", api_key)
+	http.headers_set(&req.headers, "anthropic-version", "2023-06-01")
+	return
+}
+
+anthropic_get_token_count :: proc(
+	config: ^LLM_Provider_Config,
+	api_key, input: string,
+	program_allocator, temp_allocator: mem.Allocator,
+) -> (
+	token_count: int,
+	err: Error,
+) {
+	req := anthropic_create_request(temp_allocator, api_key)
+
+	{ 	// req data
+		Data :: struct {
+			messages: []struct {
+				content: string,
+				role:    string,
+			},
+			model:    string,
+		}
+
+		data := Data {
+			messages = {{content = input, role = "user"}},
+			model    = config.model,
+		}
+		data_json, merr := json.marshal(data, allocator = temp_allocator)
+		if merr != nil {
+			err = error_new(merr)
+			return
+		}
+		log.infof("%s LLM Request data: %s", LLM_Provider.Anthropic, string(data_json))
+		bytes.buffer_init(&req.body, data_json)
+	}
+
+	Input_Tokens_Reponse :: struct {
+		input_tokens: int,
+	}
+	response: Input_Tokens_Reponse
+
+	result, herr := http_request(
+		req,
+		config.api_url_token_count,
+		temp_allocator,
+		program_allocator,
+		&response,
+	)
+	if herr != nil {
+		err = error_new(herr)
+		return
+	}
+	if herr, ok := result.(Http_Request_Err); ok {
+		err = error_new(herr)
+		return
+	}
+
+	token_count = response.input_tokens
+	return
+}
+
+anthropic_send_prompt :: proc(
+	config: ^LLM_Provider_Config,
+	api_key, input: string,
+	program_allocator, temp_allocator: mem.Allocator,
+) -> (
+	message: string,
+	output_tokens: int,
+	err: Error,
+) {
+	req := anthropic_create_request(temp_allocator, api_key)
+
+	{ 	// req data
+		Data :: struct {
+			max_tokens: int,
+			messages:   []struct {
+				content: string,
+				role:    string,
+			},
+			model:      string,
+		}
+
+		data := Data {
+			max_tokens = 128000,
+			messages   = {{content = input, role = "user"}},
+			model      = config.model,
+		}
+		data_json, merr := json.marshal(data, allocator = temp_allocator)
+		if merr != nil {
+			err = error_new(merr)
+			return
+		}
+		log.infof("%s LLM Request data: %s", LLM_Provider.Anthropic, string(data_json))
+		bytes.buffer_init(&req.body, data_json)
+	}
+
+	Messages_Content :: struct {
+		text: string,
+		type: string,
+	}
+
+	Messages_Response :: struct {
+		content: []Messages_Content,
+		usage:   struct {
+			output_tokens: int,
+		},
+	}
+
+	response: Messages_Response
+
+	result, herr := http_request(
+		req,
+		config.api_url_create_message,
+		temp_allocator,
+		program_allocator,
+		&response,
+	)
+	if herr != nil {
+		err = error_new(herr)
+		return
+	}
+	if herr, ok := result.(Http_Request_Err); ok {
+		err = error_new(herr)
+		return
+	}
+
+	found := false
+	for content in response.content {
+		if content.type == "text" {
+			message = content.text
+			found = true
+			break
+		}
+	}
+	if !found {
+		err = error_new(nil, "missing text content in anthropic response")
+	}
+
+	output_tokens = response.usage.output_tokens
+
+	return
+}
 
 FILE_TEMPL :: `        %s:
             - status: %s

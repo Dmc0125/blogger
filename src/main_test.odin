@@ -1,6 +1,5 @@
 package main
 
-import "base:runtime"
 import "core:log"
 import "core:testing"
 
@@ -56,7 +55,7 @@ test_minify_modified_single_hunk :: proc(t: ^testing.T) {
 +    doNewThing()`
 
 	result := minify_patch(patch, "modified", context.allocator)
-    if !testing.expect_value(t, result, expected) {
+	if !testing.expect_value(t, result, expected) {
 		log.info(transmute([]byte)result)
 	}
 	delete(result, context.allocator)

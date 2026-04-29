@@ -10,8 +10,6 @@ import "core:os"
 import "core:path/filepath"
 import "core:strings"
 
-import http_client "../vendor/odin-http/client"
-
 IGNORED_DIRECTORIES :: [?]string{"vendor", "target"}
 IGNORED_SUFFIXES :: [?]string {
 	// lock files
@@ -45,6 +43,7 @@ Error_Og :: union {
 	mem.Allocator_Error,
 	Http_Error,
 	Http_Request_Err,
+	json.Marshal_Error,
 }
 
 error_og_string :: proc(err: Error_Og) -> string {
@@ -55,7 +54,7 @@ error_og_string :: proc(err: Error_Og) -> string {
 	switch e in err {
 	case os.Error:
 		return os.error_string(e)
-	case mem.Allocator_Error, Http_Error:
+	case mem.Allocator_Error, Http_Error, json.Marshal_Error:
 		scratch: [256]byte
 		scratch_arena: mem.Arena
 		mem.arena_init(&scratch_arena, scratch[:])
@@ -334,7 +333,7 @@ generate_blogpost_prompt :: proc(
 		files_str: strings.Builder
 		strings.builder_init(&files_str, allocator = temp_allocator)
 
-		file_loop: for file, i in details.files {
+		file_loop: for file in details.files {
 			for dir in IGNORED_DIRECTORIES {
 				if strings.contains(
 					file.filename,
@@ -409,6 +408,7 @@ generate_blogpost_prompt :: proc(
 	return
 }
 
+
 main :: proc() {
 	context = runtime.default_context()
 
@@ -436,6 +436,7 @@ main :: proc() {
 
 	github_access_token: string
 	openai_api_key: string
+	anthropic_api_key: string
 
 	{ 	// setup config
 		defer free_all(temp_allocator)
@@ -476,11 +477,20 @@ main :: proc() {
 			); err != nil {
 				error_fatal_new(err)
 			}
+			if anthropic_api_key, _, err = read_prompt(
+				"Anthropic API key: ",
+				256,
+				program_allocator,
+				true,
+			); err != nil {
+				error_fatal_new(err)
+			}
 
 			data := fmt.aprintf(
-				"github_access_token=%s\nopenai_api_key=%s",
+				"github_access_token=%s\nopenai_api_key=%s\nanthropic_api_key=%s",
 				github_access_token,
 				openai_api_key,
+				anthropic_api_key,
 				allocator = temp_allocator,
 			)
 
@@ -538,7 +548,10 @@ main :: proc() {
 				error_fatal_new(nil, "Missing github access token")
 			}
 			if openai_api_key, ok = config["openai_api_key"]; !ok {
-				error_fatal_new(nil, "Missing github access token")
+				error_fatal_new(nil, "Missing open ai api key")
+			}
+			if anthropic_api_key, ok = config["anthropic_api_key"]; !ok {
+				error_fatal_new(nil, "Missing anthropic api key")
 			}
 		case:
 			error_fatal_new(cferr)
@@ -549,18 +562,22 @@ main :: proc() {
 
 	choice, cherr := read_choice("What do you want to create?", {"Blogpost", "Readme"})
 	if cherr != nil {
-		fmt.println("unable to read from stdin: ", cherr)
-		return
+		error_fatal_new(cherr)
+	}
+	llm_provider_choice, lerr := read_choice(
+		"Which LLM do you want to use?",
+		{OPEN_AI_MODEL, ANTHROPIC_AI_MODEL},
+	)
+	if lerr != nil {
+		error_fatal_new(lerr)
 	}
 	github_owner, _, goerr := read_prompt("Github repo owner: ", 100, program_allocator)
 	if goerr != nil {
-		fmt.println("unable to read from stdin: ", goerr)
-		return
+		error_fatal_new(goerr)
 	}
 	github_repo, _, grerr := read_prompt("Github repository name: ", 100, program_allocator)
 	if grerr != nil {
-		fmt.println("unable to read from stdin: ", grerr)
-		return
+		error_fatal_new(grerr)
 	}
 	authors_note, _, anerr := read_prompt(
 		"Author's note (can be left empty):\n",
@@ -568,8 +585,7 @@ main :: proc() {
 		program_allocator,
 	)
 	if anerr != nil {
-		fmt.println("unable to read from stdin: ", anerr)
-		return
+		error_fatal_new(anerr)
 	}
 
 	fmt.println(DIVIDER)
@@ -628,37 +644,34 @@ main :: proc() {
 
 	// LLM
 
+	llm_provider: LLM_Provider
+	llm_provider_api_key: string
+	switch llm_provider_choice {
+	case OPEN_AI_MODEL:
+		llm_provider = .Open_Ai
+		llm_provider_api_key = openai_api_key
+	case ANTHROPIC_AI_MODEL:
+		llm_provider = .Anthropic
+		llm_provider_api_key = anthropic_api_key
+	}
+
+	llm_config := llm_providers[llm_provider]
+
 	{ 	// token count
-		print(.Loading, "Fetching token count")
 		defer free_all(temp_allocator)
+		print(.Loading, "Fetching token count")
 
-		req, err := create_open_ai_request(temp_allocator, openai_api_key, llm_prompt)
-		if err != nil {
-			fmt.println("unable to create open ai request: ", err)
-			return
-		}
-
-		url := fmt.aprintf(
-			"%s/responses/input_tokens",
-			OPEN_AI_API_URL,
-			allocator = temp_allocator,
+		token_count, err := llm_config->get_token_count(
+			llm_provider_api_key,
+			llm_prompt,
+			program_allocator,
+			temp_allocator,
 		)
-
-		Input_Tokens_Reponse :: struct {
-			input_tokens: int,
-		}
-		response: Input_Tokens_Reponse
-
-		req_result, rerr := http_request(req, url, temp_allocator, program_allocator, &response)
-		if err != nil {
-			fmt.println("unable to fetch count if input tokens: ", err)
-			return
-		}
-		if req_err, ok := req_result.(Http_Request_Err); ok {
-			error_fatal_new(req_err)
+		if err.valid {
+			error_fatal(&err)
 		}
 
-		printf(.Success, "Token count: %d\n", response.input_tokens, clear_line = true)
+		printf(.Success, "Token count: %d\n", token_count, clear_line = true)
 	}
 
 	should_continue, cerr := read_confirmation("Do you want to continue?")
@@ -673,63 +686,33 @@ main :: proc() {
 
 	fmt.println(DIVIDER)
 
-	Response_Output_Content :: struct {
-		type: string,
-		text: string,
-	}
+	llm_message: string
 
-	Response_Output :: struct {
-		type:    string,
-		id:      string,
-		status:  string,
-		role:    string,
-		content: []Response_Output_Content,
-	}
-
-	Create_Response_Response :: struct {
-		output: []Response_Output,
-		usage:  struct {
-			input_tokens:  int,
-			output_tokens: int,
-		},
-	}
-
-	llm_response: Create_Response_Response
 	{ 	// send prompt
 		print(.Loading, "Sending prompt")
-		defer {
-			printf(
-				.Success,
-				"LLM response received (output tokens: %d)\n",
-				llm_response.usage.output_tokens,
-				clear_line = true,
-			)
-			free_all(temp_allocator)
-		}
+		defer free_all(temp_allocator)
 
-		req, err := create_open_ai_request(temp_allocator, openai_api_key, llm_prompt)
-		if err != nil {
-			fmt.println("unable to create open ai request: ", err)
-			return
-		}
-
-		url := fmt.aprintf("%s/responses", OPEN_AI_API_URL, allocator = temp_allocator)
-
-		req_result, rerr := http_request(
-			req,
-			url,
-			temp_allocator,
+		output_tokens: int
+		err: Error
+		llm_message, output_tokens, err = llm_config->send_prompt(
+			llm_provider_api_key,
+			llm_prompt,
 			program_allocator,
-			&llm_response,
+			temp_allocator,
 		)
-		if rerr != nil {
-			fmt.println("unable to fetch LLM response: ", err)
-			return
+		if err.valid {
+			error_fatal(&err)
 		}
-		if req_err, ok := req_result.(Http_Request_Err); ok {
-			error_fatal_new(req_err)
-		}
+
+		printf(
+			.Success,
+			"LLM response received (output tokens: %d)\n",
+			output_tokens,
+			clear_line = true,
+		)
 	}
+
+	// save response
 
 	exe_path := os.args[0]
 	// NOTE: temp_allocator is empty, we can ignore the error
@@ -764,14 +747,8 @@ main :: proc() {
 		error_fatal_new(oerr)
 	}
 
-	for o in llm_response.output {
-		for content in o.content {
-			if content.type == "output_text" {
-				if _, err := os.write(out_file, transmute([]byte)content.text); err != nil {
-					error_fatal_new(err)
-				}
-			}
-		}
+	if _, err := os.write(out_file, transmute([]byte)llm_message); err != nil {
+		error_fatal_new(err)
 	}
 
 	printf(.Success, "%s generated\n", choice)

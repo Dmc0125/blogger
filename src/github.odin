@@ -97,11 +97,10 @@ minify_patch :: proc(patch, status: string, allocator: mem.Allocator) -> string 
 		change_line_start: int
 		first_change_line: bool
 
-		for line, i in patch_lines {
+		for line in patch_lines {
 			switch {
 			case strings.has_prefix(line, "@@"):
 				// hunk header
-				ok: bool
 				n: int
 				if change_line_start, _ = strconv.parse_int(line[4:], 10, &n); n == 0 {
 					assert(
